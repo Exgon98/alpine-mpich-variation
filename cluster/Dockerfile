@@ -51,6 +51,7 @@ COPY project/ .
 
 # Normal build command
 RUN mpicc -o mpi_hello_world mpi_hello_world.c
+RUN mpic++ primos.c++ -o primos
 
 # ####################
 # For Docker beginner:
