@@ -26,8 +26,21 @@
 
 set -e
 
+# Default values if providing empty
+SIZE=4
+PROJECT_NAME="mpi"
+NETWORK_NAME="mpi-network"
+NETWORK_SUBNET="10.0.9.0/24"
+SSH_PORT="2222"
+
+# Include config variables if the file exists
 # shellcheck disable=SC1091
-. ./.env
+if [ -f ./swarm.conf ]; then
+    . ./swarm.conf
+fi
+
+MPI_MASTER_SERVICE_NAME="${PROJECT_NAME}-master"
+MPI_WORKER_SERVICE_NAME="${PROJECT_NAME}-worker"
 
 #######################
 # TASK INDICATORS
@@ -39,44 +52,49 @@ COMMAND_LOGIN=0
 COMMAND_EXEC=0
 COMMAND_LIST=0
 COMMAND_CLEAN=0
+COMMAND_CONFIG=0
 
-# Default values if providing empty
-SIZE=4
+OPTION_SHOW=0
+OPTION_SET=0
+OPTION_DELAY=1
+OPTION_SSH_KEYGEN=0
+OPTION_WATCH=0
 
+SHELL_COMMAND=""
 #############################################
 usage ()
 {
-    echo " Alpine MPICH Cluster (for Docker Compose on single Docker host)"
+    echo " Alpine MPICH Cluster (for Swarm Mode on multi Docker hosts)"
     echo ""
-    echo " USAGE: ./cluster.sh [COMMAND] [OPTIONS]"
+    echo " USAGE: ./swarm.sh [COMMAND] [OPTIONS]"
     echo ""
     echo " Examples of [COMMAND] can be:"
     echo "      up: start cluster"
-    echo "          ./cluster.sh up size=10"
+    echo "          ./swarm.sh up size=10"
     echo ""
     echo "      scale: resize the cluster"
-    echo "          ./cluster.sh scale size=30"
+    echo "          ./swarm.sh scale size=30"
     echo ""
     echo "      reload: rebuild image and distribute to nodes"
-    echo "          ./cluster.sh reload size=15"
+    echo "          ./swarm.sh reload size=15"
     echo ""
     echo "      login: login to Docker container of MPI master node for interactive usage"
-    echo "          ./cluster.sh login"
+    echo "          ./swarm.sh login"
     echo ""
     echo "      exec: execute shell command at the MPI master node"
-    echo "          ./cluster.sh exec [SHELL COMMAND]"
+    echo "          ./swarm.sh exec [SHELL COMMAND]"
     echo ""
     echo "      down: shutdown cluster"
-    echo "          ./cluster.sh down"
+    echo "          ./swarm.sh down"
     # echo ""
     # echo "      clean: remove images in the system"
-    # echo "          ./cluster.sh clean"
+    # echo "          ./swarm.sh clean"
     echo ""
     echo "      list: show running containers of cluster"
-    echo "          ./cluster.sh list"
+    echo "          ./swarm.sh list"
     echo ""
     echo "      help: show this message"
-    echo "          ./cluster.sh help"
+    echo "          ./swarm.sh help"
     echo ""
     echo "  "
 }
@@ -86,35 +104,179 @@ HEADER="
         (.___\\/{
 ~^~^~^~^~^~^~^~^~^~^~^~^~"
 
+set_variables ()
+{
+    MPI_MASTER_SERVICE_NAME="${PROJECT_NAME}-master"
+    MPI_WORKER_SERVICE_NAME="${PROJECT_NAME}-worker"
+}
+
+
+delay ()
+{
+    if [ $OPTION_DELAY -ne 0 ]; then
+        sleep ${OPTION_DELAY}
+    fi
+}
+
+up_network ()
+{
+    printf "\\n%s\\n" "$HEADER"
+    printf "$ docker network create  \\
+                --driver overlay      \\
+                --subnet %s  \\
+                --opt encrypted       \\
+                %s\\n" "${NETWORK_SUBNET}" "${NETWORK_NAME}"
+    printf "\\n"
+
+    docker network create               \
+            --driver overlay            \
+            --subnet ${NETWORK_SUBNET}  \
+            --opt encrypted             \
+            ${NETWORK_NAME}
+
+    echo "=> network is created"
+
+    delay
+}
+
+down_network ()
+{
+    printf "\\n\\n===> REMOVE NETWORK"
+
+    printf "\\n%s\\n" "$HEADER"
+    echo "$ docker network rm ${NETWORK_NAME}"
+    printf "\\n"
+    if docker network rm ${NETWORK_NAME} ; then
+        echo "=> network is removed"
+    else
+        echo "=> No problem"
+    fi
+
+    delay
+}
+
+up_master ()
+{
+    printf "\\n\\n===> SPIN UP MASTER SERVICE"
+
+    printf "\\n%s\\n" "$HEADER"
+    printf "$ docker service create \\
+        --name %s \\
+        --replicas 1 \\
+        --network %s \\
+        --publish %s:22 \\
+        --user root \\
+        %s mpi_bootstrap \\
+            mpi_master_service_name=%s \\
+            mpi_worker_service_name=%s \\
+            role=master\\n" \
+    "${MPI_MASTER_SERVICE_NAME}" "${NETWORK_NAME}" "${SSH_PORT}" "${IMAGE_TAG}" \
+    "${MPI_MASTER_SERVICE_NAME}" "${MPI_WORKER_SERVICE_NAME}"
+
+    printf "\\n"
+
+    docker service create                      \
+        --name ${MPI_MASTER_SERVICE_NAME}      \
+        --replicas 1                           \
+        --network ${NETWORK_NAME}              \
+        --publish ${SSH_PORT}:22               \
+        --user root                            \
+        "${IMAGE_TAG}" mpi_bootstrap             \
+                    mpi_master_service_name=${MPI_MASTER_SERVICE_NAME} \
+                    mpi_worker_service_name=${MPI_WORKER_SERVICE_NAME} \
+                    role=master
+
+    echo "=> master service is created"
+
+    delay
+}
+
+up_workers ()
+{
+    printf "\\n\\n===> SPIN UP WORKER SERVICE"
+    NUM_WORKER=$((SIZE - 1))
+
+    printf "\\n%s\\n" "$HEADER"
+    printf "$ docker service create \\
+        --name %s \\
+        --replicas %s \\
+        --network %s \\
+        --user root \\
+        %s mpi_bootstrap \\
+            mpi_master_service_name=%s \\
+            mpi_worker_service_name=%s \\
+            role=worker\\n" \
+    "${MPI_WORKER_SERVICE_NAME}" "${NUM_WORKER}" "${NETWORK_NAME}" "${IMAGE_TAG}" \
+    "${MPI_MASTER_SERVICE_NAME}" "${MPI_WORKER_SERVICE_NAME}"
+
+    printf "\\n"
+
+    docker service create                      \
+        --name ${MPI_WORKER_SERVICE_NAME}      \
+        --replicas ${NUM_WORKER}               \
+        --network ${NETWORK_NAME}              \
+        --user root                            \
+        "${IMAGE_TAG}" mpi_bootstrap             \
+                    mpi_master_service_name=${MPI_MASTER_SERVICE_NAME} \
+                    mpi_worker_service_name=${MPI_WORKER_SERVICE_NAME} \
+                    role=worker
+
+    echo "=> worker service is created"
+
+    delay
+}
+
+scale_workers ()
+{
+    printf "\\n\\n===> SCALE SERVICES"
+    NUM_WORKER=$((SIZE - 1))
+
+    printf "\\n%s\\n" "$HEADER"
+    printf "$ docker service scale %s=%s" \
+        "${MPI_WORKER_SERVICE_NAME}" "${NUM_WORKER}"
+
+    printf "\\n"
+
+    docker service scale ${MPI_WORKER_SERVICE_NAME}=${NUM_WORKER}
+
+    echo "=> New cluster size is $SIZE"
+
+    delay
+}
+
+down_services ()
+{
+    printf "\\n%s\\n" "$HEADER"
+    echo "$ docker service rm ${MPI_MASTER_SERVICE_NAME} ${MPI_WORKER_SERVICE_NAME}"
+    printf "\\n"
+    if ! docker service rm ${MPI_MASTER_SERVICE_NAME} ${MPI_WORKER_SERVICE_NAME} ; then
+        echo "=> No problem"
+    fi
+
+    delay
+}
+
+
+
 down_all ()
 {
     printf "\\n\\n===> CLEAN UP CLUSTER"
-
-    printf "\\n%s\\n" "$HEADER"
-    echo "$ docker-compose down"
-    printf "\\n"
-
-    docker-compose down
+    down_services
+    down_network
 }
 
-up_registry ()
-{
-    printf "\\n\\n===> SPIN UP REGISTRY"
 
-    printf "\\n%s\\n" "$HEADER"
-    echo "$ docker-compose up -d registry"
-    printf "\\n"
-
-    docker-compose up -d registry
-}
 
 generate_ssh_keys ()
 {
-    if [ -f ssh/id_rsa ] && [ -f ssh/id_rsa.pub ]; then
-        return 0
-    fi
+    # if [ -f ssh/id_rsa ] && [ -f ssh/id_rsa.pub ]; then
+    #     return 0
+    # fi
 
     printf "\\n\\n===> GENERATE SSH KEYS \\n\\n"
+    echo "$ rm -f ssh/id_rsa ssh/id_rsa.pub"
+    printf "\\n"
+    rm -f ssh/id_rsa ssh/id_rsa.pub
 
     echo "$ mkdir -p ssh/ "
     printf "\\n"
@@ -129,45 +291,19 @@ build_and_push_image ()
 {
     printf "\\n\\n===> BUILD IMAGE"
     printf "\\n%s\\n" "$HEADER"
-    echo "$ docker build -t \"$REGISTRY_ADDR:$REGISTRY_PORT/$IMAGE_NAME\" ."
+    echo "$ docker build -t \"$IMAGE_TAG\" ."
     printf "\\n"
-    docker build -t "$REGISTRY_ADDR:$REGISTRY_PORT/$IMAGE_NAME" .
+    docker build -t "$IMAGE_TAG" .
 
     printf "\\n"
 
     printf "\\n\\n===> PUSH IMAGE TO REGISTRY"
     printf "\\n%s\\n" "$HEADER"
-    echo "$ docker push \"$REGISTRY_ADDR:$REGISTRY_PORT/$IMAGE_NAME\""
+    echo "$ docker push \"$IMAGE_TAG\""
     printf "\\n"
-    docker push "$REGISTRY_ADDR:$REGISTRY_PORT/$IMAGE_NAME"
+    docker push "$IMAGE_TAG"
 }
 
-up_master ()
-{
-    printf "\\n\\n===> SPIN UP MASTER NODE"
-    printf "\\n%s\\n" "$HEADER"
-    echo "$ docker-compose up -d master"
-    printf "\\n"
-    docker-compose up -d master
-}
-
-
-up_workers ()
-{
-    printf "\\n\\n===> SPIN UP WORKER NODES"
-    printf "\\n%s\\n" "$HEADER"
-    echo "$ docker-compose up -d worker"
-    printf "\\n"
-    docker-compose up -d worker 
-
-    printf "\\n"
-    printf "\\n%s\\n" "$HEADER"
-
-    NUM_WORKER=$((SIZE - 1))
-    echo "$ docker-compose scale worker=$NUM_WORKER"
-    printf "\\n"
-    docker-compose scale worker=${NUM_WORKER}
-}
 
 down_master ()
 {
@@ -185,29 +321,43 @@ down_workers ()
     printf "\\n%s\\n" "$HEADER"
     echo "$ docker-compose stop worker && docker-compose rm -f worker"
     printf "\\n"
-    docker-compose stop worker && docker-compose rm -f worker
+    docker-compose stop master && docker-compose rm -f master
 }
 
 list ()
 {
-    printf "\\n\\n===> LIST CONTAINERS"
-    printf "\\n%s\\n" "$HEADER"
-    echo "$ docker-compose ps"
-    printf "\\n"
-    docker-compose ps
+    docker service ls | awk '{ print $2, $3 }' | column -t
 }
 
 
 exec_on_mpi_master_container ()
 {
     # shellcheck disable=SC2046
-    docker exec -it -u mpi $(docker-compose ps | grep 'master'| awk 'NR==1{print $1}') "$@"
+    docker exec -it -u mpi $(docker-compose ps | grep 'master'| awk '{print $1}') "$@"
+}
+
+set_config ()
+{
+cat > ./swarm.conf <<- EOF
+IMAGE_TAG=${IMAGE_TAG}
+PROJECT_NAME=${PROJECT_NAME}
+NETWORK_NAME=${NETWORK_NAME}
+NETWORK_SUBNET=${NETWORK_SUBNET}
+SSH_ADDR=${SSH_ADDR}
+SSH_PORT=${SSH_PORT}
+EOF
+}
+
+show_config ()
+{
+    cat ./swarm.conf
 }
 
 prompt_ready ()
 {
     printf "\\n\\n===> CLUSTER READY \\n\\n"
 }
+
 
 show_instruction ()
 {
@@ -221,6 +371,7 @@ show_instruction ()
     echo '                  \____\_______/                  '
     echo '                                                  '
     echo '                 Alpine MPICH Cluster             '
+    echo '                      Swarm Mode                  '
     echo ''
     echo ' More info: https://github.com/NLKNguyen/alpine-mpich'
     echo ''
@@ -229,12 +380,10 @@ show_instruction ()
 
     echo "To run MPI programs in an interative shell:"
     echo "  1. Login to master node:"
-    echo "     Using Docker through command wrapper:"
-    echo "     $ ./cluster.sh login"
+    echo "     $ ./swarm.sh login"
     echo ""
-    echo "     Or using SSH with keys through exposed port:"
-    echo "     $ ssh -o \"StrictHostKeyChecking no\" -i ssh/id_rsa -p $SSH_PORT mpi@localhost"
-    echo '       where [localhost] could be changed to the host IP of master node'
+    echo "     which is equivalent to:"
+    echo "     $ ssh -o \"StrictHostKeyChecking no\" -i ssh/id_rsa -p $SSH_PORT mpi@$SSH_ADDR"
     echo ""
     echo "  2. Execute MPI programs inside master node, for example:"
     echo "     $ mpirun hostname"
@@ -246,10 +395,10 @@ show_instruction ()
     echo ""
     echo ""
     echo "To run directly a shell command at master node:"
-    echo "     $ ./cluster.sh exec [COMMAND]"
+    echo "     $ ./swarm.sh exec [COMMAND]"
     echo ""
     echo "     Example: "
-    echo "     $ ./cluster.sh exec mpirun hostname"
+    echo "     $ ./swarm.sh exec mpirun hostname"
     echo ""
 }
 
@@ -267,21 +416,49 @@ do
             usage
             exit
             ;;
+
         -i)
             show_instruction
             exit
             ;;
 
-        login)
-            COMMAND_LOGIN=1
+        config)
+            COMMAND_CONFIG=1
             ;;
 
-        exec)
-            COMMAND_EXEC=1
-            shift # the rest is the shell command to run in the node
-            SHELL_COMMAND="$*"
-            break # end while loop
-            ;;
+            show)
+                OPTION_SHOW=1
+                ;;
+
+            set)
+                OPTION_SET=1
+                ;;
+
+                ### key-value pairs
+                IMAGE_TAG)
+                    [ "$VALUE" ] && IMAGE_TAG=$VALUE
+                    ;;
+
+                PROJECT_NAME)
+                    [ "$VALUE" ] && PROJECT_NAME=$VALUE
+                    ;;
+
+                NETWORK_NAME)
+                    [ "$VALUE" ] && NETWORK_NAME=$VALUE
+                    ;;
+
+                NETWORK_SUBNET)
+                    [ "$VALUE" ] && NETWORK_SUBNET=$VALUE
+                    ;;
+
+                SSH_PORT)
+                    [ "$VALUE" ] && SSH_PORT=$VALUE
+                    ;;
+
+                SSH_ADDR)
+                    [ "$VALUE" ] && SSH_ADDR=$VALUE
+                    ;;
+
 
         up)
             COMMAND_UP=1
@@ -291,26 +468,46 @@ do
             COMMAND_DOWN=1
             ;;
 
+        scale)
+            COMMAND_SCALE=1
+            ;;
+
         reload)
             COMMAND_RELOAD=1
             ;;
 
-        scale)
-            COMMAND_SCALE=1
+        login)
+            COMMAND_LOGIN=1
             ;;
 
         list)
             COMMAND_LIST=1
             ;;
 
-        clean)
-            COMMAND_CLEAN=1
+        exec)
+            COMMAND_EXEC=1
+            shift # the rest is the shell command to run in the node
+            SHELL_COMMAND="$*"
+            break # end while loop
             ;;
 
+        ### options
         size)
             [ "$VALUE" ] && SIZE=$VALUE
             ;;
 
+        
+        --delay)
+            [ "$VALUE" ] && OPTION_DELAY=$VALUE
+            ;;
+
+        --generate-ssh-keys)
+            OPTION_SSH_KEYGEN=1
+            ;;
+
+        --watch)
+            OPTION_WATCH=1
+            ;;                    
         *)
             echo "ERROR: unknown parameter \"$PARAM\""
             usage
@@ -320,53 +517,87 @@ do
     shift
 done
 
+set_variables
+
+watch_replicas_resizing ()
+{
+    while sleep 0.5
+    do
+      clear; docker service ls | awk '{ print $2, $3 }' | column -t && printf '\nPress Ctrl + C to stop watching'
+    done
+    # watch -n 0.1 "docker service ls | awk '{ print \$2, \$3 }' | column -t && printf '\nPress Ctrl + C to stop watching'"
+    # ^ Some systems don't come with `watch` program
+}
 
 if [ $COMMAND_UP -eq 1 ]; then
     down_all
-    up_registry
-    generate_ssh_keys
+
+    if [ $OPTION_SSH_KEYGEN -eq 1 ]; then
+        generate_ssh_keys
+    fi
     build_and_push_image
+    up_network
     up_master
     up_workers
+
+    if [ $OPTION_WATCH -eq 1 ]; then
+        watch_replicas_resizing
+    fi
 
     prompt_ready
     show_instruction
 
 elif [ $COMMAND_DOWN -eq 1 ]; then
-    down_all
+    down_services
+    down_network
+
+elif [ $COMMAND_CONFIG -eq 1 ]; then
+    if [ $OPTION_SHOW -eq 1 ]; then
+        show_config
+    elif [ $OPTION_SET -eq 1 ]; then
+        set_config
+    else
+        echo "command config: missing argument 'show' or 'set'"
+    fi
 
 elif [ $COMMAND_CLEAN -eq 1 ]; then
     echo "TODO"
 
 
 elif [ $COMMAND_SCALE -eq 1 ]; then
-    down_master
-    down_workers
-    up_master
-    up_workers
-
-    prompt_ready
-    show_instruction
+    scale_workers
+    if [ $OPTION_WATCH -eq 1 ]; then
+        watch_replicas_resizing
+    fi
 
 elif [ $COMMAND_RELOAD -eq 1 ]; then
-    down_master
-    down_workers
+    down_services
+
+    if [ $OPTION_SSH_KEYGEN -eq 1 ]; then
+        generate_ssh_keys
+    fi
     build_and_push_image
     up_master
     up_workers
+
+    if [ $OPTION_WATCH -eq 1 ]; then
+        watch_replicas_resizing
+    fi
 
     prompt_ready
     show_instruction
 
 elif [ $COMMAND_LOGIN -eq 1 ]; then
-    exec_on_mpi_master_container /bin/sh
+    # shellcheck disable=SC2086
+    ssh -o "StrictHostKeyChecking no" -i ssh/id_rsa -p ${SSH_PORT} mpi@${SSH_ADDR}
 
 elif [ $COMMAND_EXEC -eq 1 ]; then
-    exec_on_mpi_master_container ash -c "${SHELL_COMMAND}"
+    # shellcheck disable=SC2029 disable=SC2086
+    ssh -o "StrictHostKeyChecking no" -i ssh/id_rsa -p ${SSH_PORT} mpi@${SSH_ADDR} \
+    ". /etc/profile; . ~/.profile; $SHELL_COMMAND"
 
 elif [ $COMMAND_LIST -eq 1 ]; then
     list
 else
     usage
 fi
-
