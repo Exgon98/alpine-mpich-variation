@@ -1,4 +1,4 @@
-FROM nlknguyen/alpine-mpich:latest
+FROM nlknguyen/alpine-mpich:onbuild
 
 USER root
 
